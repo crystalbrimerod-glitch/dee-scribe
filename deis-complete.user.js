@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         DEIS - AdvancedMD scribe, complete
 // @namespace    dryeye.institute
-// @version      3.3
-// @description  Everything one machine needs: opens the EHR as a tab instead of a popup, and carries the whole scribe library, re-seeding it on every page load. Self-updating from dryeyeequation.com.
+// @version      3.4
+// @description  Everything one machine needs: opens the EHR as a tab instead of a popup, and carries the whole scribe library, re-seeding it on every page load. Self-updating from GitHub (crystalbrimerod-glitch/dee-scribe).
 // @match        *://*.advancedmd.com/*
 // @run-at       document-start
 // @grant        none
-// @updateURL    https://dryeyeequation.com/deis/deis-complete.user.js
-// @downloadURL  https://dryeyeequation.com/deis/deis-complete.user.js
+// @updateURL    https://raw.githubusercontent.com/crystalbrimerod-glitch/dee-scribe/main/deis-complete.user.js
+// @downloadURL  https://raw.githubusercontent.com/crystalbrimerod-glitch/dee-scribe/main/deis-complete.user.js
 // ==/UserScript==
 
 /* THIS IS THE ONLY SCRIPT A MACHINE NEEDS.
@@ -30,7 +30,21 @@
    in a FIXED folder (File Manager / FTP), overwritten in place.
 
    WHOEVER CONTROLS THAT URL RUNS CODE ON PAGES WITH PATIENT CHARTS OPEN. It
-   belongs on CB's own domain and nowhere else.
+   belongs on CB's own account and nowhere else.
+
+   v3.4, 9/9/2026, overnight - HOST MIGRATED. dryeyeequation.com was never
+   reachable by CB, and dryeye.institute turned out to run on Kajabi, which
+   has no stable per-file URL (tested directly - see never-regress-ledger.md;
+   Kajabi mints a new one-time link per upload, same trap as WordPress's
+   Media Library). @updateURL/@downloadURL now point at a PUBLIC GitHub repo
+   under CB's own account instead:
+     https://raw.githubusercontent.com/crystalbrimerod-glitch/dee-scribe/main/deis-complete.user.js
+   Public means this file is viewable by anyone with the link (not indexed
+   or advertised, but not access-controlled) - CB's own informed tradeoff,
+   accepted because dryeyeequation.com/Kajabi weren't viable. Shipping a
+   change now means: edit the module file, rebuild, bump @version, then on
+   github.com open this file in the repo, click the pencil (edit) icon,
+   paste the new content over the old, commit - same address, every time.
 
    v3.1, 9/9/2026 - THIS UPLOAD IS NOT YET DONE. Folded in four fixes that had
    drifted out of sync between deis-core.js (canonical) and this deployed
@@ -70,7 +84,7 @@
         done, changes from last time, anything worth surfacing at a glance)
         instead of composing the whole line once at the end. Idempotent -
         won't duplicate a piece already present. NOT YET TESTED LIVE.
-   UNTIL THIS FILE IS UPLOADED to https://dryeyeequation.com/deis/deis-complete.user.js
+   UNTIL THIS FILE IS UPLOADED to https://raw.githubusercontent.com/crystalbrimerod-glitch/dee-scribe/main/deis-complete.user.js
    (same address, replacing whatever version is currently live), every
    machine still running an older deployed script is missing ALL SEVEN fixes
    above and needs the OLD live-patch workarounds documented in
@@ -2057,6 +2071,6 @@
   try { document.addEventListener('DOMContentLoaded', seed); } catch(e){}
 
   window.__deisBoot = function(){ return eval(SRC.DEISBOOT); };
-  window.__deisVersion = 'DEIS complete 3.3 (self-updating) - popup fix ON, patientName+clearSafe+plan-visibility+preSave+gapFix+infoAdd folded in, ' + Object.keys(SRC).length +
+  window.__deisVersion = 'DEIS complete 3.4 (self-updating from GitHub) - popup fix ON, patientName+clearSafe+plan-visibility+preSave+gapFix+infoAdd folded in, ' + Object.keys(SRC).length +
     ' modules + ' + Object.keys(ACRO).length + ' acronyms, seeded ' + new Date().toLocaleTimeString();
 })();
