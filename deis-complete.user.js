@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DEIS - AdvancedMD scribe, complete
 // @namespace    dryeye.institute
-// @version      3.7
+// @version      3.8
 // @description  Everything one machine needs: opens the EHR as a tab instead of a popup, and carries the whole scribe library, re-seeding it on every page load. Self-updating from GitHub (crystalbrimerod-glitch/dee-scribe).
 // @match        *://*.advancedmd.com/*
 // @run-at       document-start
@@ -110,6 +110,30 @@
    above and needs the OLD live-patch workarounds documented in
    never-regress-ledger.md (and per that file, live-patching is not reliable
    from a Claude/Cowork session either - a safety classifier has blocked it).
+
+   v3.8, 9/15/2026 - H/O BLOCK SILENT-DROP BUG, found by code review (not yet
+   confirmed against the specific chart from the 9/14->9/15 incident, but a
+   real, reproduced bug in deis-gap.js independent of that). __gapParse used
+   the literal 10-dash string '----------' matched with indexOf - an EXACT
+   match. __preSave's own separator warning (deis-sup.js) already used the
+   looser /-{5,}/ (5-or-more dashes). That mismatch is real: an 8- or
+   12-dash separator line passes __preSave's "you have a separator" check
+   while __gapParse fails to find it, so the ENTIRE H/O block falls into
+   ordinary line parsing, lands in the unboxed-other bucket, and __gap()'s
+   output builder never re-emitted those lines - silently deleted on the
+   next regeneration (which fires on every ANTERIOR OU tab click). Reproduced
+   standalone with a mock box before shipping this fix: an 8-dash separator
+   made the whole H/O section vanish on __gap(true), exactly as described.
+   Fixed: separator detection now uses the same /^-{5,}\s*$/m dash-only-line
+   test everywhere, so it can never disagree with __preSave's check again.
+   Also added a second, independent safety net: ANY leftover unboxed line -
+   even with no separator at all - is now re-appended verbatim and flagged
+   in the notes instead of silently dropped, so the worst case is "ugly and
+   flagged" rather than "clean and missing content." Unit-tested against
+   three cases before upload (8-dash, 10-dash, no-separator-at-all) - see
+   never-regress-ledger.md. STILL UNCONFIRMED whether this is what actually
+   happened on the chart CB flagged that night - check that chart's own
+   separator before assuming this was the whole story.
 
    v3.7, 9/15/2026 - NOTE-DATE GUARD. Real data loss the night of 9/14->9/15:
    CB opening OLD notes to review/sign (not scribing) had writes land in them
@@ -1565,7 +1589,11 @@
   var d = w.document;
   function T(el){ return (el.textContent||'').replace(/\s+/g,' ').trim(); }
   var TITLE = 'CONFIRM WITH PATIENT - tech to confirm times per day and then erase this title line';
-  var SEP = '----------';
+  // FIXED 9/15/2026 - was the literal 10-dash string '----------' matched
+  // with indexOf (an EXACT match). Now any line that is 5-or-more dashes
+  // alone on its own line - the same test __preSave's warning already uses
+  // (deis-sup.js: /-{5,}/) - so the two checks can never disagree again.
+  var SEP_RE = /^-{5,}\s*$/m;
   // Procedures are excluded - this box lists what the PATIENT does at home.
   // Evidence: TESTY had Prokera and Tixel checked in PRESCRIBED and neither
   // appears in the report the earlier session wrote.
@@ -1631,7 +1659,11 @@
   // accumulate visit over visit.
   window.__gapParse = function(){
     var box = window.__pruBox(); if (!box) return null;
-    var raw = String(box.value), si = raw.indexOf(SEP);
+    var raw = String(box.value);
+    // FIXED 9/15/2026 - see the top-of-file entry #3. A dash-ONLY line of 5+
+    // dashes counts as the separator now, not an exact 10-dash literal.
+    var sepMatch = raw.match(SEP_RE);
+    var si = sepMatch ? raw.indexOf(sepMatch[0]) : -1;
     var head = si < 0 ? raw : raw.slice(0, si);
     var tail = si < 0 ? '' : raw.slice(si);
     var items = [], other = [];
@@ -1718,6 +1750,22 @@
     // carried forward but NOT prescribed today: kept, listed WITHOUT a checkbox
     var carried = st.items.filter(function(it){ return !kept.some(function(k){ return sameItem(k, it.name); }); });
     carried.forEach(function(it){ lines.push(it.full); notes.push('carried forward, not prescribed today: ' + it.name); });
+    // FIXED 9/15/2026, entry #4 - NEVER silently drop a leftover unboxed
+    // line. Before this, anything that landed in st.other (most commonly
+    // the H/O block spilling out of a malformed/miscounted separator - see
+    // entry #3, now largely fixed at the source) was computed, consulted
+    // for dose lookups, and then just vanished from the regenerated box.
+    // Now: re-append it verbatim and say so, so the worst case is "ugly and
+    // flagged" instead of "clean and silently missing content."
+    if (st.other && st.other.length){
+      st.other.forEach(function(it){
+        lines.push(it.full);
+        notes.push('UNBOXED LEFTOVER LINE PRESERVED (not silently dropped) - "' + it.full +
+          '" was not inside a [ ]/[x] box and had no recognized ' + SEP_RE.source + ' separator above it. ' +
+          'If this is really H/O content, add a line of 5+ dashes above it by hand so it goes back to being ' +
+          'preserved as a block instead of listed here as loose text.');
+      });
+    }
     var out = [TITLE].concat(lines);
     if (st.tail) out.push(st.tail.replace(/^\n+/,''));
     var text = out.join('\n');
@@ -1853,7 +1901,7 @@
   };
 
   return 'gap installed: __gap __gapParse __pruBox __prescribed __gapNote __whenDate __pruneOptions';
-}).toString() + ')()';
+}).toString() + ')();'
 
   SRC.DEISAUTO = '(' + (function DEISAUTO(){
   var w = window.__cn; if (!w) return 'NO NOTE FRAME';
@@ -2359,6 +2407,6 @@
   try { document.addEventListener('DOMContentLoaded', seed); } catch(e){}
 
   window.__deisBoot = function(){ return eval(SRC.DEISBOOT); };
-  window.__deisVersion = 'DEIS complete 3.7 (self-updating from GitHub) - popup fix ON, patientName+clearSafe+plan-visibility+preSave+gapFix+infoAdd+revertCount+liveChecked+dateGuard folded in, ' + Object.keys(SRC).length +
+  window.__deisVersion = 'DEIS complete 3.8 (self-updating from GitHub) - popup fix ON, patientName+clearSafe+plan-visibility+preSave+gapFix+infoAdd+revertCount+liveChecked+dateGuard+gapSepFix folded in, ' + Object.keys(SRC).length +
     ' modules + ' + Object.keys(ACRO).length + ' acronyms, seeded ' + new Date().toLocaleTimeString();
 })();
