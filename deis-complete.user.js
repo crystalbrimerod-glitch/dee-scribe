@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DEIS - AdvancedMD scribe, complete
 // @namespace    dryeye.institute
-// @version      3.4
+// @version      3.6
 // @description  Everything one machine needs: opens the EHR as a tab instead of a popup, and carries the whole scribe library, re-seeding it on every page load. Self-updating from GitHub (crystalbrimerod-glitch/dee-scribe).
 // @match        *://*.advancedmd.com/*
 // @run-at       document-start
@@ -31,6 +31,26 @@
 
    WHOEVER CONTROLS THAT URL RUNS CODE ON PAGES WITH PATIENT CHARTS OPEN. It
    belongs on CB's own account and nowhere else.
+
+   v3.5, 9/9/2026, overnight - COMPLETENESS AUDIT, one cosmetic fix found and
+   folded in. CB asked directly: every registered machine was actually still
+   on "DEIS complete 2.0" (the old, popup-fix-plus-library era, before this
+   file existed at all - see machine-registry.md's EXAM 1 entry and
+   userscripts.md), not v3.0 as later entries in never-regress-ledger.md had
+   assumed - so this file's embedded modules were compared line by line
+   against deis-core.js/deis-cc.js/deis-gap.js/deis-auto.js/deis-sup.js/
+   deis-acronyms.json (the canonical sources) AND against the old
+   deis-library.user.js v1.0 (what "2.0" actually was, plus the separate
+   popup-fix script). Result: every one of the seven fixes already listed in
+   the v3.1/v3.2/v3.3 entries below is confirmed present and correct, PART 1
+   (popup->tab) and PART 2 (re-seeding) are both confirmed intact, and all 51
+   acronyms match. ONE genuine gap found, purely cosmetic: __revert()'s own
+   baseline-restore loop lost an `n++` somewhere in the v3.0 rebuild, so its
+   return message always reported "0 radios to baseline" instead of the real
+   count - the revert itself still correctly unchecked/restored everything;
+   only the reported number was wrong. Fixed here and in deis-core.js. No
+   patient-facing behavior changed by this fix - it does not need to jump the
+   queue ahead of a normal upload cycle.
 
    v3.4, 9/9/2026, overnight - HOST MIGRATED. dryeyeequation.com was never
    reachable by CB, and dryeye.institute turned out to run on Kajabi, which
@@ -90,6 +110,21 @@
    above and needs the OLD live-patch workarounds documented in
    never-regress-ledger.md (and per that file, live-patching is not reliable
    from a Claude/Cowork session either - a safety classifier has blocked it).
+
+   v3.6, 9/15/2026 - root-caused on TESTY TE, cb laptop, after three real
+   patients on 9/14/2026 all showed __applyGrid apparently writing the wrong
+   value to different fields each time. See never-regress-ledger.md's
+   9/15/2026 root-cause entry for the full reproduction and proof; short
+   version: every group object's `checked` property (inside SRC.DEISALL,
+   where G is built) used to be a PLAIN ARRAY computed ONCE at bind time and
+   never updated again - byte-identical to g.baseline for the entire life of
+   the binding. window.__find(sec,finding,eye)[0].checked, the "independent
+   verification" this project repeatedly trusted OVER __applyGrid's own
+   bundled "--- READ BACK ---", was therefore reading frozen, pre-write data
+   every time. __applyGrid's own bundled readback (built by __audit(), which
+   re-queries the live DOM fresh) was correct the whole time. Fix: `checked`
+   is now a live getter running the same query __audit() uses; g.baseline is
+   unaffected (captured via a new g.__bindChecked, set once, same as before).
 
    PART 1 - open the EHR in a TAB, not a popup.
      Without it AdvancedMD opens the EHR in a popup WINDOW, invisible to Claude
@@ -343,18 +378,36 @@
     var opts = a.map(function(o){ return labelAfter(o.el); });
     var find = opts.filter(function(t){ return t && !/^(MILD|MOD|SEV|TR|GR\d|Gr\d|-|)$/.test(t); })
                    .sort(function(x,y){ return y.length-x.length; })[0] || '';
-    G.push({
+    var bindChecked = a.filter(function(o){ return o.el.checked; }).map(function(o){ return labelAfter(o.el); });
+    var gg = {
       nm:nm, n:a.length, opts:opts, find:find,
       y: Math.round(a[0].y),
       x: Math.round(Math.min.apply(null, a.map(function(o){ return o.x; }))),
-      checked: a.filter(function(o){ return o.el.checked; }).map(function(o){ return labelAfter(o.el); }),
       sec:'?', eye:''
+    };
+    // FIXED 9/15/2026 - see the top-of-file note. `checked` used to be a
+    // plain array frozen at bind time (identical to baseline forever after).
+    // Now a live getter that runs the exact same live DOM query __audit()
+    // uses, so window.__find(...)[0].checked always reflects the current
+    // DOM, not the value the note opened with.
+    Object.defineProperty(gg, 'checked', {
+      get: function(){
+        var els = [].slice.call(d.getElementsByName(gg.nm));
+        return els.filter(function(r){ return r.checked; }).map(function(r){ return gg.opts[els.indexOf(r)]; });
+      },
+      enumerable: true, configurable: true
     });
+    gg.__bindChecked = bindChecked;
+    G.push(gg);
   });
   window.__groups = G;
   // BASELINE - last visit's chart. Snapshot BEFORE anything is cleared, or the
   // SUMMARY comparison and the cue readouts are impossible.
-  G.forEach(function(g){ g.baseline = g.checked.slice(); g.dictated = false; g.restored = false; });
+  // FIXED 9/15/2026: reads the frozen bind-time snapshot (g.__bindChecked),
+  // NOT the now-live g.checked getter above - baseline must stay a fixed
+  // point-in-time value for __restore()/__diff() to compare against, exactly
+  // as it always has.
+  G.forEach(function(g){ g.baseline = g.__bindChecked.slice(); g.dictated = false; g.restored = false; });
 
   var NAMES = ['ADNEXIA','LASHES','LIDS','TEAR FILM','CONJUNCTIVA','CORNEA','A/C','IRIS','LENS',
                'INTERFEROMETRY','DEBRIDEMENT','MG EXPRESSION','MG QUALITY'];
@@ -635,7 +688,7 @@
     G.forEach(function(g){
       var els = [].slice.call(d.getElementsByName(g.nm));
       els.forEach(function(r){ if (r.checked){ r.checked = false; r.dispatchEvent(new Event('change',{bubbles:true})); } });
-      g.baseline.forEach(function(val){ var i = g.opts.indexOf(val); if (i < 0) return; els[i].checked = true; fire(els[i]); });
+      g.baseline.forEach(function(val){ var i = g.opts.indexOf(val); if (i < 0) return; els[i].checked = true; fire(els[i]); n++; });
       g.dictated = false; g.restored = false;
     });
     var t = 0;
@@ -2071,6 +2124,6 @@
   try { document.addEventListener('DOMContentLoaded', seed); } catch(e){}
 
   window.__deisBoot = function(){ return eval(SRC.DEISBOOT); };
-  window.__deisVersion = 'DEIS complete 3.4 (self-updating from GitHub) - popup fix ON, patientName+clearSafe+plan-visibility+preSave+gapFix+infoAdd folded in, ' + Object.keys(SRC).length +
+  window.__deisVersion = 'DEIS complete 3.6 (self-updating from GitHub) - popup fix ON, patientName+clearSafe+plan-visibility+preSave+gapFix+infoAdd+revertCount+liveChecked folded in, ' + Object.keys(SRC).length +
     ' modules + ' + Object.keys(ACRO).length + ' acronyms, seeded ' + new Date().toLocaleTimeString();
 })();
