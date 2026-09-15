@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DEIS - AdvancedMD scribe, complete
 // @namespace    dryeye.institute
-// @version      3.6
+// @version      3.7
 // @description  Everything one machine needs: opens the EHR as a tab instead of a popup, and carries the whole scribe library, re-seeding it on every page load. Self-updating from GitHub (crystalbrimerod-glitch/dee-scribe).
 // @match        *://*.advancedmd.com/*
 // @run-at       document-start
@@ -110,6 +110,40 @@
    above and needs the OLD live-patch workarounds documented in
    never-regress-ledger.md (and per that file, live-patching is not reliable
    from a Claude/Cowork session either - a safety classifier has blocked it).
+
+   v3.7, 9/15/2026 - NOTE-DATE GUARD. Real data loss the night of 9/14->9/15:
+   CB opening OLD notes to review/sign (not scribing) had writes land in them
+   anyway, deleting original CC and Patient Reports Using content across at
+   least six charts. Root-caused live on TESTY TE's own stale 6/8/2026 note
+   (which already had __supWarn active): __supervise()'s "BACK ON A PREVIOUS
+   NOTE" warning only fires for a frame THIS SESSION already bound to earlier
+   - a note opened cold (never bound this session) looks brand-new and
+   rebinds silently, no warning. That is almost certainly why last night
+   produced zero warnings.
+
+   Fix: deis-sup.js adds __noteDate() / __dateGuard() / __dateCheck() -
+   reads the note's own date straight from the DOM (field
+   ucNoteDateTime_dateTime, fallback hidPracticeTime - both confirmed live
+   on TESTY). Do NOT use hidNoteDate/hidNoteSignDate - those are
+   last-touched timestamps, not the date of service, and on this exact 6/8
+   note they already read 9/14 (the incident night) - using them would have
+   MASKED the very failure this guard exists to catch.
+
+   deis-core.js's __setVal, __setChk, __setOne, __setIdx and __restore -
+   the only places any writer touches the DOM - now call __dateGuard()
+   first and refuse (no write, returns BLOCKED: ...) when the bound note's
+   date does not match today. FAILS OPEN (warns, does not block) if the
+   date field can't be found, so a renamed field on some other note
+   template can never turn into "nothing can ever be written again".
+
+   Unit-tested against the real field values pulled live from TESTY's
+   stale note before this upload (old date -> blocked, matching date ->
+   allowed, missing field -> warned not blocked, no frame -> warned not
+   blocked) - see never-regress-ledger.md. NOT YET tested as a live write
+   attempt inside AdvancedMD itself (in-session live patching is blocked by
+   a safety classifier here, per the v3.1 entry below). CONFIRM ON TESTY TE
+   before trusting this on a real chart: open an old note, run
+   __dateCheck(), expect BLOCKED - then open today's note, expect OK.
 
    v3.6, 9/15/2026 - root-caused on TESTY TE, cb laptop, after three real
    patients on 9/14/2026 all showed __applyGrid apparently writing the wrong
@@ -326,7 +360,18 @@
   }
   // every text write journals its prior value so __revert can undo it
   window.__journal = [];
+  // ADDED 9/15/2026: every text/checkbox write now checks __dateGuard()
+  // (deis-sup.js) first and refuses if the bound note's own date doesn't
+  // match today - real data loss happened the night of 9/14->9/15 when
+  // writes landed in OLD notes CB had opened to review/sign, not scribe.
+  // Fails OPEN (does not block) if the guard can't find the date field or
+  // isn't loaded yet - a renamed field must never turn into "nothing can
+  // ever be written." Fails CLOSED on an actual date mismatch.
   window.__setVal = function(e, v){
+    if (window.__dateGuard){
+      var g = window.__dateGuard();
+      if (g.block){ window.__lastBlocked = g.reason; return 'BLOCKED: ' + g.reason; }
+    }
     if (!e.__jrn){ window.__journal.push({e:e, prior:e.value}); e.__jrn = true; }
     e.value = v;
     e.dispatchEvent(new Event('input',  {bubbles:true}));
@@ -337,6 +382,10 @@
   // checkboxes, so __proc's treatment box and __opFinish's consent boxes stayed
   // checked after an undo. Caught on TESTY 9/3/2026.
   window.__setChk = function(e, v){
+    if (window.__dateGuard){
+      var g = window.__dateGuard();
+      if (g.block){ window.__lastBlocked = g.reason; return 'BLOCKED: ' + g.reason; }
+    }
     if (!e.__jrn){ window.__journal.push({e:e, prior:e.checked, kind:'chk'}); e.__jrn = true; }
     e.checked = !!v;
     e.dispatchEvent(new Event('click',  {bubbles:true}));
@@ -499,9 +548,17 @@
       return true;
     });
   };
-  // FIXED 9/8/2026: skip groups already marked g.dictated so a second
-  // __applyGrid call this same visit does not wipe an earlier pass's
-  // findings (see deis-core.js for the full incident and reasoning).
+  // FIXED 9/8/2026: this used to unconditionally uncheck every __safe-section
+  // group on every call. __restore() (below) skips groups already marked
+  // g.dictated, on the assumption they already hold the correct value from an
+  // earlier __applyGrid call this visit - but if __clearSafe just wiped them
+  // and nothing in THIS call's spec re-sets them, they are left empty and
+  // NOTHING puts them back. Caught live on Ronald Gilbert's real chart when a
+  // second __applyGrid call (Debridement/MG EXPRESSION/MG QUALITY) wiped the
+  // first call's CONJUNCTIVA/CORNEA/LIDS/TEAR FILM findings. Skipping already-
+  // dictated groups here means a normal multi-interval dictation never loses
+  // an earlier pass, without requiring every call to re-pass the full
+  // cumulative spec.
   window.__clearSafe = function(){
     var n = 0;
     G.forEach(function(g){
@@ -513,7 +570,14 @@
     });
     return 'unchecked ' + n;
   };
+  // ADDED 9/15/2026: same __dateGuard() check as __setVal/__setChk above -
+  // the exam grid writes via checked/fire() directly, never through
+  // __setVal, so it needs its own copy of the guard, not a shared wrapper.
   window.__setOne = function(sec, finding, eye, value){
+    if (window.__dateGuard){
+      var dg = window.__dateGuard();
+      if (dg.block){ window.__lastBlocked = dg.reason; return 'BLOCKED: ' + dg.reason; }
+    }
     var gs = window.__find(sec, finding, eye);
     if (!gs.length)   return 'NO MATCH ' + sec+'/'+finding+'/'+eye;
     if (gs.length > 1) return 'AMBIGUOUS x'+gs.length+' '+sec+'/'+finding+'/'+eye;
@@ -527,6 +591,10 @@
   // the trailing "-" means the finding is ABSENT. norm() eats a leading dash,
   // so __setOne cannot reach it - set it by index instead.
   window.__setIdx = function(sec, finding, eye, idx){
+    if (window.__dateGuard){
+      var dg2 = window.__dateGuard();
+      if (dg2.block){ window.__lastBlocked = dg2.reason; return 'BLOCKED: ' + dg2.reason; }
+    }
     var gs = window.__find(sec, finding, eye);
     if (gs.length !== 1) return 'RESOLVE FAIL '+sec+'/'+finding+'/'+eye+' x'+gs.length;
     var g = gs[0], els = [].slice.call(d.getElementsByName(g.nm));
@@ -538,6 +606,10 @@
   // clearing alone silently drops last visit's LENS, sensitivity, drop-out and
   // truncation. Anything not dictated today goes back to its baseline.
   window.__restore = function(){
+    if (window.__dateGuard){
+      var dg3 = window.__dateGuard();
+      if (dg3.block) return ['BLOCKED: ' + dg3.reason];
+    }
     var r = [];
     G.forEach(function(g){
       if (window.__safe.indexOf(g.sec) < 0 || g.dictated || !g.baseline.length) return;
@@ -625,10 +697,29 @@
   };
 
   /* ---- 10. the plan box ---------------------------------------------------
-     THE HEADLINER MUST SURVIVE EVERY WRITE.
-     FIXED 9/8/2026 EVENING: __plan() now prefers a VISIBLE textarea over
-     plain DOM order when picking among candidates matching the plan regex -
-     see deis-core.js for the full Ronald Gilbert incident this closes.     */
+     THE HEADLINER MUST SURVIVE EVERY WRITE. The box arrives carrying an
+     overview diagnosis plus the follow-up / RTC line above the first SUMMARY:
+     e.g. "INFLAMMATORY DRY EYE DRIVEN BY FACIAL AND OCULAR ROSACEA".
+     Three charts lost theirs on 9/2 before this was enforced.
+     Per-visit state is keyed to the TEXTAREA ELEMENT: __planSaved was once a
+     global and still held the first patient of the day hours later, so
+     __revert() would have pasted another patient's plan into this chart.
+
+     FIXED 9/8/2026 EVENING: __plan() used to take the FIRST textarea in DOM
+     order matching /FOLLOW UP|TODAY:|SUMMARY:/i, with no visibility check.
+     On Ronald Gilbert's real chart, PT CC's "Primary Issue Today" complaint
+     box (sitting inside a display:none jQuery-UI tab panel) had been
+     contaminated at some earlier point with plan-shaped text and came FIRST
+     in DOM order, so __plan() silently bound every writer (__setPlan,
+     __appendPlan, __planSection) to that hidden PT CC field instead of the
+     real, visible PLAN box. Caught only because CB compared the note to her
+     own dictation and it didn't match - nothing in the tool layer detected
+     the mismatch. Fix: prefer a VISIBLE candidate (nonzero
+     getBoundingClientRect().width) over DOM order. This does not fully
+     close the hole - two VISIBLE textareas both matching the regex are still
+     possible in principle - but it closes the exact failure observed, and a
+     visible-candidate check is now the standing rule for verifying any
+     __planBox binding (see never-regress-ledger.md).                       */
   window.__plan = function(){
     var cands = [].slice.call(d.querySelectorAll('textarea'))
       .filter(function(e){ return /FOLLOW UP|TODAY:|SUMMARY:/i.test(e.value); });
@@ -659,6 +750,9 @@
     if (!window.__planBox) return 'PLAN BOX NOT FOUND';
     var hdr = window.__planHeader || '', first = hdr.split('\n')[0].trim();
     if (hdr && opts.keepHeader !== false && first && text.indexOf(first) < 0) text = hdr + '\n\n' + text;
+    // CB 9/4/2026: 'add a line space before PLAN so it is not buried in the text.'
+    // Covers the standalone PLAN: headings AND the '> PLAN: ...' lines that sit
+    // at the bottom of an OPTIONS block - those were the buried ones.
     text = window.__planSpace(text);
     window.__setVal(window.__planBox, text);
     return 'plan written ' + text.length + ' chars | HEADLINER RETAINED: ' +
@@ -682,7 +776,14 @@
     return 'section "' + label + '" replaced, plan now ' + nv.length;
   };
 
-  /* ---- 11. undo -----------------------------------------------------------*/
+  /* ---- 11. undo -----------------------------------------------------------
+     FIXED 9/9/2026 (found during the v2.0->v3.4 completeness audit): the
+     baseline-restore loop below used to increment n (deis-library.user.js
+     v1.0, and every version until this one) but that n++ was lost somewhere
+     along the v3.0 rebuild - purely cosmetic, __revert() still actually
+     unchecked/restored everything correctly, but its own return message
+     always reported "0 radios to baseline" instead of the real count.
+     Restored so the reported count matches what actually happened.        */
   window.__revert = function(){
     var n = 0;
     G.forEach(function(g){
@@ -709,7 +810,15 @@
     return 'REVERTED: ' + n + ' radios to baseline, ' + t + ' fields (text and checkbox) to their prior state.';
   };
 
-  /* ---- 12. the one-call grid write --------------------------------------*/
+  /* ---- 12. the one-call grid write --------------------------------------
+     The ONLY way to write the grid. Dry-runs everything and aborts before any
+     write on AMBIG/NOMATCH; auto-reverts if it throws mid-way. __clearSafe
+     unchecks the not-yet-dictated __safe radios before re-setting them, so an
+     exception between those two steps is the worst thing this tool can do to
+     a live chart. As of 9/8/2026, __clearSafe leaves already-dictated groups
+     alone, so calling __applyGrid more than once in the same visit (normal -
+     CB dictates in two or three intervals) no longer wipes an earlier pass;
+     see the note on __clearSafe above.                                     */
   window.__applyGrid = function(spec, none){
     var b = window.__bindCheck();
     if (!b.ok) return 'BLOCKED: ' + b.why;
@@ -733,7 +842,24 @@
     }
   };
 
-  /* ---- 13. procedure day, places 1, 2 and 4 -----------------------------*/
+  /* ---- 13. procedure day, places 1, 2 and 4 -----------------------------
+     KEY BY PANEL, NEVER BY NAME. The treatment column labels appear TWICE,
+     once under "PLAN: OPTIONS DISCUSSED TODAY" and again under "PRESCRIBED
+     TREATMENTS". Resolve the column from its LABEL inside the same script
+     that writes it - a remembered coordinate put a treatment date in the
+     Plugs box on 9/2.
+     THE PRESCRIBED COLUMN NAMES, verified 9/3/2026 (row y1355):
+        LLLT   Tixel   Lipiflow   IPL   Plugs   TT Pads   Cliradex
+     They are NOT the OPTIONS-band names one row group up, which read
+        LLLT   Tixel i   Lipiflow   IPL   Plugs
+     __proc('IPL/RF') FAILS - the column is called 'IPL'. Use 'Tixel', not
+     'Tixel i'. 'IPL/RF' is the DEVICE name on the OP note, not a column.
+
+     __procedureDone(o), below, already batches THIS section plus HISTORY
+     plus the Info comment into ONE call with the tab-waits built in - see
+     the note on it further down. Use it instead of calling __proc/__hist/
+     __info by hand unless something about the visit genuinely needs them
+     separately.                                                            */
   window.__panelBand = function(){
     var presc = null, reports = null, options = null;
     [].slice.call(d.querySelectorAll('*')).forEach(function(el){
@@ -829,17 +955,23 @@
     window.__setVal(fld, text);
     return 'INFO: "'+was+'" to written';
   };
-  // ADDED 9/9/2026, late evening (CB, going to bed, last instruction of the
-  // night): "you should also add in the info tab summary as you learn the
-  // items/procedures and changes from last time to implement." Builds the
-  // Info-tab Comment field UP as things are learned during a visit, instead
-  // of composing it once at the end - same "write it the moment you learn
-  // it, don't batch" philosophy as Rule Zero. Idempotent: won't duplicate a
-  // piece already present (case-insensitive substring check). Starts an
-  // empty box with "OSD: " per procedure-day-protocol.md's standing default
-  // reason unless the piece itself already carries an ALLCAPS: prefix.
-  // NOT YET TESTED LIVE - built with no browser access at the end of the
-  // night. Test on TESTY before trusting it on a real visit.
+  // ADDED 9/9/2026, late evening. CB: "you should also add in the info tab
+  // summary as you learn the items/procedures and changes from last time to
+  // implement." Builds the Info comment INCREMENTALLY - one piece at a time,
+  // as each is learned during the visit - instead of composing the whole
+  // OSD: line once at the end. Reuses __info's own field-finding logic
+  // rather than duplicating it with a different result.
+  // Idempotent: re-adding a piece already present in the line is a no-op,
+  // reported rather than silently duplicated - the same item can easily be
+  // learned twice (a tech mentions a change, then CB confirms the same thing
+  // in the plan a few minutes later).
+  // The FIRST piece added to an empty box starts the line with "OSD: " per
+  // procedure-day-protocol.md section 2's standing default reason. This does
+  // NOT invent a different reason - if a visit's reason genuinely isn't OSD,
+  // say so and pass the full "REASON: " prefix as the first piece instead of
+  // a bare item.
+  // NOT YET TESTED LIVE - see the top-of-file note. Test on TESTY before
+  // trusting it on a real visit.
   window.__infoAdd = function(item, apply){
     if (apply === undefined) apply = true;
     var lbl = null;
@@ -869,8 +1001,18 @@
     if (apply) window.__setVal(fld, next);
     return window.__san((apply ? 'INFO ADDED: ' : 'dry run: ') + '"'+piece+'"  ->  "'+next+'"');
   };
-  // ORCHESTRATOR - already batches places 1, 2 and 4 in ONE call. Use it
-  // instead of calling __proc/__hist/__info by hand.
+  // ORCHESTRATOR - places 1 (treatment panel), 2 (Info comment) and 4 (HISTORY)
+  // in ONE call, with the tab-waits built in. This already exists and already
+  // does what procedure-day-protocol.md's "Speed" section asks for - it is
+  // simply undocumented there, so sessions keep doing these three steps by
+  // hand instead of calling it. Use it:
+  //   await __procedureDone({name:'Tixel', date:'9/9/2026', block:'Tixel History',
+  //                          type:'Tixel i', info:'OSD: tixel i, ...'})
+  // Only place 3 (the diagnosis-linked PLAN line, via __appendPlan/__setPlan)
+  // and place 5 (the OP note template) are NOT covered - the OP note's
+  // context menu is a real native menu and needs a screenshot-confirmed
+  // browser_batch sequence, not a page-side function; see procedure-day-
+  // protocol.md.
   window.__procedureDone = async function(o){
     var log = [];
     log.push(await window.__tabWait('ANTERIOR OU','ADNEXIA',4000));
@@ -887,7 +1029,11 @@
     return window.__san(log.join('\n'));
   };
 
-  /* ---- 14. the OP note ---------------------------------------------------*/
+  /* ---- 14. the OP note ---------------------------------------------------
+     The right-click MUST land on blank body. Landing in a text field opens the
+     Cut/Copy/Paste menu instead of "Drop at Click Position", Escape will NOT
+     dismiss it (click elsewhere), and recovering cost five calls on 9/2.
+     Menu geometry is relative to the click: CB at +64y and -170x, arrow -60x. */
   window.__opSpot = function(){
     var w = window.__cn, dd = w.document, fr = {x:0,y:0};
     try { var b = w.frameElement.getBoundingClientRect(); fr = {x:b.left, y:b.top}; } catch(e){}
@@ -924,6 +1070,10 @@
     });
     return res.length ? res : '"'+name+'" not found in the DOM - use the screenshot';
   };
+  // Insert leaves gaps. Verify Fitzpatrick against HISTORY SKIN TYPE; the device
+  // group Lumenis M22 / IPL/RF / Both arrives UNSET (CB's standard is IPL/RF);
+  // THE PATIENT CONSENT BOX ARRIVES UNCHECKED - check it. Two templates in one
+  // note can carry DIFFERENT Fitzpatrick values - compare and report.
   window.__opFinish = function(skin){
     var res = [], by = {};
     function after(el){
@@ -964,6 +1114,7 @@
     var cbs = [].slice.call(d.querySelectorAll('input[type=checkbox]')).filter(function(c){ return c.getBoundingClientRect().width; });
     res.push('AUDIT: unset ' + unset.length + (unset.length ? ' '+unset.join(' ') : '') +
              ' | boxes ' + cbs.filter(function(c){ return c.checked; }).length + ' of ' + cbs.length);
+    // report every Fitzpatrick group so two templates can be compared
     Object.keys(by2).forEach(function(nm){
       var labs = by2[nm].map(after);
       if (labs.indexOf('I') < 0 && labs.indexOf('II') < 0) return;
@@ -973,7 +1124,10 @@
     return window.__san(res.join('\n'));
   };
 
-  /* ---- 15. cue readouts --------------------------------------------------*/
+  /* ---- 15. cue readouts --------------------------------------------------
+     CB's format: NO field names, one eye at a time, RIGHT FIRST, and an absent
+     finding is spoken as "clear" - never skipped, because skipping shifts every
+     later value out of position when she is matching by count.             */
   var SAY = {TR:'trace',GR1:'grade 1',GR2:'grade 2',GR3:'grade 3',GR4:'grade 4',
     MILD:'mild',MOD:'moderate',SEV:'severe',CLEAN:'clean',NO:'no color',SOME:'some color',
     GREAT:'great color',NONE:'none',LIMITED:'limited',MEDIOCRE:'mediocre',EXCELLENT:'excellent',
@@ -1101,6 +1255,7 @@
       ' | cues ' + Object.keys(window.__SLOTS||{}).length +
       ' | host ' + location.hostname);
   };
+  // writes nothing - run this on TESTY before the first live patient
   window.__selftest = function(){
     var r = [], bySec = {};
     G.forEach(function(g){ bySec[g.sec] = (bySec[g.sec]||0)+1; });
@@ -1130,7 +1285,7 @@
   out.push('staining boxes: OD ' + window.__stainBox.OD.length + ' OS ' + window.__stainBox.OS.length);
   out.push('acronyms loaded: ' + Object.keys(window.__X).length);
   return out.join('\n');
-}).toString() + ')()';
+}).toString() + ')();'
 
   SRC.DEISCC = '(' + (function DEISCC(){
   var w = window.__cn; if (!w) return 'NO NOTE FRAME - load DEISALL first';
@@ -1912,6 +2067,14 @@
   window.__MODS = MODS;
   window.__seenFrames = window.__seenFrames || [];
 
+  // Re-running the modules rebinds __cn and RE-SNAPSHOTS THE BASELINE. That is
+  // right for a note we have never seen and badly wrong for one we already
+  // wrote to — it would record our own writes as "last visit", which is the
+  // data the SUMMARY diff and every cue readout are built from.
+  // So: auto-rebind only to a NEW frame. Coming back to an earlier note leaves
+  // __cnBound stale, and __bindCheck then blocks every writer until a session
+  // reloads on purpose. Blocked writes are recoverable; a corrupted baseline is
+  // not.
   window.__reload = function(){
     var log = [];
     MODS.forEach(function(k){
@@ -1938,6 +2101,12 @@
         window.__supWarn = null;
         var r = window.__reload();
         var n = (window.__groups||[]).length;
+        // A rebind that lands while ANTERIOR OU is not rendered maps ZERO groups,
+        // and the baseline that the SUMMARY diff and every cue readout depend on
+        // would be empty — silently, with every module reporting success.
+        // OBSERVED 9/4/2026: the supervisor rebound reporting "groups 0".
+        // Never accept it. Drop the frame, unbind, retry next tick; __bindCheck
+        // then blocks every writer until a good map lands.
         if (n < 60){
           window.__seenFrames = window.__seenFrames.filter(function(f){ return f !== act; });
           window.__cnBound = null;
@@ -1954,13 +2123,70 @@
     return 'not running';
   };
 
-  // NEW 9/9/2026 - see the top-of-file changelog. Run before every Save.
+  /* ---- the note-date guard ------------------------------------------------
+     __noteDate() reads the note's own date straight from the DOM, fresh,
+     every call — never cached, because the whole point is to catch a note
+     that changed out from under a stale binding.
+     __dateGuard() compares it to __today() (the page clock, Eastern —
+     never the session clock, see __today()'s own comment in deis-core.js).
+     FAILS OPEN if the field can't be found (warn, don't block — a renamed
+     field on some other note template must never turn into "every write
+     everywhere is blocked"). FAILS CLOSED on an actual mismatch (block,
+     don't warn — that is precisely the case that caused real data loss).
+  */
+  window.__noteDate = function(){
+    var dd = window.__cn && window.__cn.document;
+    if (!dd) return {ok:false, reason:'NO NOTE FRAME BOUND'};
+    var ids = ['ucNoteDateTime_dateTime','hidPracticeTime'];
+    for (var i=0;i<ids.length;i++){
+      var el = dd.getElementById(ids[i]);
+      if (el && el.value){
+        var m = String(el.value).match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+        if (m) return {ok:true, field:ids[i], raw:el.value, mdy:(+m[1])+'/'+(+m[2])+'/'+m[3]};
+      }
+    }
+    return {ok:false, reason:'NOTE DATE FIELD NOT FOUND (tried ' + ids.join(', ') + ') - guard cannot verify this note, writes NOT blocked, verify by hand'};
+  };
+
+  window.__dateGuard = function(){
+    var nd = window.__noteDate();
+    if (!nd.ok) return {block:false, warn:true, reason:nd.reason};
+    var today = window.__today ? window.__today() : null;
+    if (!today) return {block:false, warn:true, reason:'__today() unavailable - guard cannot verify, writes NOT blocked'};
+    if (nd.mdy !== today) return {block:true, warn:false, reason:'NOTE DATE ' + nd.mdy + ' DOES NOT MATCH TODAY ' + today + ' - write refused. Reload onto today\'s note before writing anything.'};
+    return {block:false, warn:false, reason:'note date ' + nd.mdy + ' matches today'};
+  };
+
+  // Spoken/console checkpoint - call this at every patient switch and after
+  // every rebind, out loud, before the first write. See START-HERE.md.
+  window.__dateCheck = function(){
+    var g = window.__dateGuard();
+    var tag = g.block ? 'BLOCKED' : (g.warn ? 'WARNING' : 'OK');
+    return tag + ' - ' + g.reason;
+  };
+
+  /* ---- the pre-save sweep -------------------------------------------------
+     Reads the DOM fresh - does not trust any earlier auto-clear or a
+     remembered "I already checked that" from earlier in the visit. Writes
+     only what it is sure about (regex-identified boilerplate lines); an
+     unchecked consent box is FLAGGED, never auto-checked, because checking
+     a consent box on CB's behalf without her having actually reviewed it
+     would be worse than leaving it flagged.                               */
   window.__preSave = function(apply){
     if (apply === undefined) apply = true;
     var dd = window.__cn && window.__cn.document;
     if (!dd) return 'NO NOTE FRAME BOUND';
     var rep = [];
 
+    // 0. Note-date guard, first, loud - if this fails everything else below
+    //    is moot.
+    try {
+      var g = window.__dateGuard();
+      rep.push((g.block ? 'BLOCKED' : (g.warn ? 'WARNING' : 'OK')) + ' - ' + g.reason);
+      if (g.block) return window.__san ? window.__san(rep.join('\n')) : rep.join('\n');
+    } catch(e){ rep.push('date guard failed: ' + e.message); }
+
+    // 1. PT CC ASK/SPLIT lines - strip unconditionally, we are about to save.
     try {
       if (!window.__CC) window.__cc();
       var C = window.__CC;
@@ -1979,6 +2205,8 @@
       }
     } catch(e){ rep.push('PT CC check failed: ' + e.message); }
 
+    // 2. The gap box's own instructional title line, and a check that the
+    //    H/O tail (below the '----------' separator) is still recognisable.
     try {
       var box = window.__pruBox ? window.__pruBox() : null;
       if (box){
@@ -1990,6 +2218,11 @@
         } else {
           rep.push('Patient Reports Using: title line already clear');
         }
+        // __gapParse/__gap only preserve what comes after a literal run of
+        // dashes as the H/O tail. If the box mentions H/O but has no such
+        // separator, that content is NOT being protected by __gap()'s tail
+        // logic - it would be at risk of being rewritten like ordinary
+        // content on the next __gap() call. Flag it, do not guess a fix.
         if (/H\W?O\b/i.test(v2) && !/-{5,}/.test(v2)){
           rep.push('WARNING: box mentions H/O but no dashed separator was found - __gap() tail-preservation will NOT protect this content on its next run. Verify by hand before relying on __gap() again on this note.');
         }
@@ -1998,6 +2231,8 @@
       }
     } catch(e){ rep.push('Patient Reports Using check failed: ' + e.message); }
 
+    // 3. Consent/attestation checkboxes ANYWHERE in the current note - a
+    //    procedure's OP note can be on a tab that is not the active one.
     try {
       var unchecked = [];
       [].slice.call(dd.querySelectorAll('input[type=checkbox]')).forEach(function(c){
@@ -2019,8 +2254,8 @@
     return window.__san ? window.__san(rep.join('\n')) : rep.join('\n');
   };
 
-  return 'supervisor installed: __supervise __supStop __reload __preSave';
-}).toString() + ')()';
+  return 'supervisor installed: __supervise __supStop __reload __preSave __noteDate __dateGuard __dateCheck';
+}).toString() + ')();'
 
   SRC.DEISBOOT = '(' + (function DEISBOOTFN(){
   var log = [], noNote = false, missing = [];
@@ -2124,6 +2359,6 @@
   try { document.addEventListener('DOMContentLoaded', seed); } catch(e){}
 
   window.__deisBoot = function(){ return eval(SRC.DEISBOOT); };
-  window.__deisVersion = 'DEIS complete 3.6 (self-updating from GitHub) - popup fix ON, patientName+clearSafe+plan-visibility+preSave+gapFix+infoAdd+revertCount+liveChecked folded in, ' + Object.keys(SRC).length +
+  window.__deisVersion = 'DEIS complete 3.7 (self-updating from GitHub) - popup fix ON, patientName+clearSafe+plan-visibility+preSave+gapFix+infoAdd+revertCount+liveChecked+dateGuard folded in, ' + Object.keys(SRC).length +
     ' modules + ' + Object.keys(ACRO).length + ' acronyms, seeded ' + new Date().toLocaleTimeString();
 })();
