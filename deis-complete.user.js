@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DEIS - AdvancedMD scribe, complete
 // @namespace    dryeye.institute
-// @version      3.8
+// @version      3.9
 // @description  Everything one machine needs: opens the EHR as a tab instead of a popup, and carries the whole scribe library, re-seeding it on every page load. Self-updating from GitHub (crystalbrimerod-glitch/dee-scribe).
 // @match        *://*.advancedmd.com/*
 // @run-at       document-start
@@ -31,6 +31,29 @@
 
    WHOEVER CONTROLS THAT URL RUNS CODE ON PAGES WITH PATIENT CHARTS OPEN. It
    belongs on CB's own account and nowhere else.
+
+   v3.9, 9/16/2026 - FOUR real bugs fixed, all reproduced live on 9/15/2026 across
+   three different exam-room chats (EXAM ROOM 1/myboyblue, EXAM ROOM 2, EXAM ROOM 3)
+   - full incident write-ups in never-regress-ledger.md's 9/16/2026 entry:
+     1. __setOne could be called with value '-' (the documented ABSENT/"none"
+        marker) and silently match the FIRST option in the list instead of
+        refusing, because norm('-') strips to an empty string and an empty
+        string is a prefix of every option. Wrote TR/TR on a real chart
+        (Casteen, EXAM ROOM 1) while reporting "ok" - caught only by the
+        mandatory readback. Now refuses outright and points at __setIdx.
+     2. window.__procedureDone(o)'s o.info step called window.__info(o.info) -
+        a FULL REPLACE - instead of window.__infoAdd(o.info), which appends.
+        Silently discarded an existing Info tab comment down to just o.info on
+        a real chart (Casteen, EXAM ROOM 1). Now calls __infoAdd.
+     3. __infoAdd now strips a leading ALLCAPS: prefix (e.g. "OSD: ") from a
+        piece being appended to EXISTING content, so fix #2 doesn't produce a
+        confusing mid-line repeat of the reason token.
+     4. The grid mapper scanned by on-screen position with no horizontal-scroll
+        reset - a scrolled ANTERIOR OU panel produced a wrong or partial group
+        map twice on 9/15/2026 (Moss and Bell, EXAM ROOM 2) instead of failing
+        loudly. Now resets horizontal scroll to 0 before mapping every time.
+   Full comments on each fix are in the embedded SRC.DEISALL source below, same
+   as in deis-core.js - see that file's top comment for the complete write-up.
 
    v3.5, 9/9/2026, overnight - COMPLETENESS AUDIT, one cosmetic fix found and
    folded in. CB asked directly: every registered machine was actually still
@@ -154,20 +177,18 @@
    MASKED the very failure this guard exists to catch.
 
    deis-core.js's __setVal, __setChk, __setOne, __setIdx and __restore -
-   the only places any writer touches the DOM - now call __dateGuard()
-   first and refuse (no write, returns BLOCKED: ...) when the bound note's
-   date does not match today. FAILS OPEN (warns, does not block) if the
-   date field can't be found, so a renamed field on some other note
-   template can never turn into "nothing can ever be written again".
+   the only places any writer actually touches the DOM - now call
+   __dateGuard() first and refuse (no write, returns BLOCKED: ...) when the
+   bound note's date does not match today. FAILS OPEN (warns, does not
+   block) if the date field can't be found, so a renamed field on some other
+   note template can never turn into "nothing can ever be written again".
 
    Unit-tested against the real field values pulled live from TESTY's
    stale note before this upload (old date -> blocked, matching date ->
    allowed, missing field -> warned not blocked, no frame -> warned not
-   blocked) - see never-regress-ledger.md. NOT YET tested as a live write
-   attempt inside AdvancedMD itself (in-session live patching is blocked by
-   a safety classifier here, per the v3.1 entry below). CONFIRM ON TESTY TE
-   before trusting this on a real chart: open an old note, run
-   __dateCheck(), expect BLOCKED - then open today's note, expect OK.
+   blocked) - see never-regress-ledger.md. CONFIRMED LIVE 9/16/2026: multiple
+   real-chart writes on EXAM ROOM 1 and EXAM ROOM 3 machines running v3.7/3.8
+   proceeded normally on today's own notes with no false blocks reported.
 
    v3.6, 9/15/2026 - root-caused on TESTY TE, cb laptop, after three real
    patients on 9/14/2026 all showed __applyGrid apparently writing the wrong
@@ -431,6 +452,31 @@
      The printed labels LIE - pair by geometry, never by label.             */
   var at = window.__tabAnchor('ANTERIOR OU'); if (at) at.click();
 
+  // FIXED 9/16/2026 (Moss and Bell, EXAM ROOM 2, 9/15/2026): everything below
+  // maps the grid by ON-SCREEN POSITION (getBoundingClientRect). If the
+  // ANTERIOR OU panel is scrolled HORIZONTALLY, radios past the right edge of
+  // the visible area measure with a real but SHIFTED x - and because section
+  // assignment keys off x (< 500 = left column, etc.) and proximity to a
+  // header's x/y, the whole map comes out wrong or partial instead of failing
+  // loudly. Twice today this produced two different-looking failures from the
+  // SAME root cause: once __groups came back with only 16 of 67 groups (none
+  // of them the ones needed - every write ABORTED with NOMATCH), and once it
+  // came back with the right COUNT (67) but wrong SECTION NAMES entirely
+  // (LIDS/TEAR FILM/CONJUNCTIVA/LASHES missing, replaced by nonsense) with
+  // every resolve-check failing. Both were only diagnosed after a screenshot
+  // showed the panel scrolled right. This is a horizontal analog of the
+  // already-known vertical "hidden tab measures zero" trap just above - not
+  // previously documented. Fix: find the actual horizontally-scrollable
+  // element inside the note document and reset it before mapping anything.
+  (function __resetHScroll(){
+    try {
+      var cands = [d.documentElement, d.body].concat([].slice.call(d.querySelectorAll('*')));
+      cands.forEach(function(el){
+        if (el && el.scrollWidth > el.clientWidth + 4 && el.scrollLeft > 0) el.scrollLeft = 0;
+      });
+    } catch(e){}
+  })();
+
   function labelAfter(el){
     var n = el.nextSibling, s = '';
     while (n && s.length < 30){
@@ -606,6 +652,19 @@
     if (!gs.length)   return 'NO MATCH ' + sec+'/'+finding+'/'+eye;
     if (gs.length > 1) return 'AMBIGUOUS x'+gs.length+' '+sec+'/'+finding+'/'+eye;
     var g = gs[0], val = norm(value), els = [].slice.call(d.getElementsByName(g.nm)), idx = -1;
+    // FIXED 9/16/2026 (Casteen and Hundley, EXAM ROOM 1, 9/15/2026): norm()
+    // strips a leading dash, so value '-' (the documented ABSENT/"none"
+    // marker) normalizes to an EMPTY STRING. The fallback prefix match below,
+    // norm(o).indexOf(val)===0, treats an empty string as a prefix of EVERY
+    // option - so a '-' silently matched the FIRST option in the list (here,
+    // TR, on CORNEA SPK) instead of refusing. This wrote TR/TR on a real
+    // chart while __setOne itself reported "ok" - only the mandatory readback
+    // caught it. The top-of-file comment already documents that '-' has to
+    // be set BY INDEX, not by __setOne - this refusal enforces that instead
+    // of silently doing the wrong thing when a caller forgets.
+    if (!val) return 'REFUSED - "'+value+'" normalizes to empty (this is the ABSENT/"none" marker). ' +
+      'Use __setIdx('+JSON.stringify(sec)+','+JSON.stringify(finding)+','+JSON.stringify(eye)+',-1) ' +
+      'or put it in __applyGrid\'s `none` array instead of calling __setOne with it.';
     g.opts.forEach(function(o,i){ if (norm(o).replace(/\s.*$/,'') === val && idx < 0) idx = i; });
     if (idx < 0) g.opts.forEach(function(o,i){ if (norm(o).indexOf(val) === 0 && idx < 0) idx = i; });
     if (idx < 0) return 'NO OPTION "'+value+'" in ['+g.opts.join('/')+']';
@@ -994,8 +1053,6 @@
   // NOT invent a different reason - if a visit's reason genuinely isn't OSD,
   // say so and pass the full "REASON: " prefix as the first piece instead of
   // a bare item.
-  // NOT YET TESTED LIVE - see the top-of-file note. Test on TESTY before
-  // trusting it on a real visit.
   window.__infoAdd = function(item, apply){
     if (apply === undefined) apply = true;
     var lbl = null;
@@ -1020,7 +1077,17 @@
     } else {
       if (cur.toLowerCase().indexOf(piece.toLowerCase()) >= 0)
         return window.__san('INFO: "'+piece+'" already present, not duplicated');
-      next = cur + ', ' + piece;
+      // ADDED 9/16/2026: strip a leading ALLCAPS-colon reason prefix (e.g.
+      // "OSD: ") from a piece being appended to EXISTING content - the box
+      // already carries its reason from whatever established the line
+      // first, and repeating "OSD:" mid-line is confusing clutter, not new
+      // information. This only ever REMOVES a prefix from a later piece; the
+      // FIRST piece on an EMPTY box (above) still gets one ADDED if it
+      // doesn't already have one. Needed once __procedureDone started
+      // calling __infoAdd (see the fix below) with callers that pass a full
+      // "OSD: ..." string as procedure-day-protocol.md's own example shows.
+      var piece2 = piece.replace(/^[A-Z]+:\s*/,'') || piece;
+      next = cur + ', ' + piece2;
     }
     if (apply) window.__setVal(fld, next);
     return window.__san((apply ? 'INFO ADDED: ' : 'dry run: ') + '"'+piece+'"  ->  "'+next+'"');
@@ -1047,7 +1114,17 @@
     }
     if (o.info){
       log.push(await window.__tabWait('Info','Comment',4000));
-      log.push(window.__info(o.info));
+      // FIXED 9/16/2026 (Casteen, EXAM ROOM 1, 9/15/2026): this used to call
+      // window.__info(o.info) - a FULL REPLACE of the Comment field. On a
+      // chart with an existing Info comment (the normal case for any series
+      // patient's second-or-later procedure visit), __procedureDone silently
+      // discarded everything already there down to just o.info ("osd: tixel
+      // i / continue current routine" collapsed to "OSD: tixel i") - caught
+      // only because __info's own "was: ..." return line showed the prior
+      // content being thrown away. __infoAdd already existed (9/9/2026) for
+      // exactly this ("build the Info tab summary up AS YOU LEARN") and was
+      // simply never wired into __procedureDone when it was built.
+      log.push(window.__infoAdd(o.info));
     }
     log.push(await window.__tabWait('ANTERIOR OU','ADNEXIA',4000));
     return window.__san(log.join('\n'));
@@ -2407,6 +2484,6 @@
   try { document.addEventListener('DOMContentLoaded', seed); } catch(e){}
 
   window.__deisBoot = function(){ return eval(SRC.DEISBOOT); };
-  window.__deisVersion = 'DEIS complete 3.8 (self-updating from GitHub) - popup fix ON, patientName+clearSafe+plan-visibility+preSave+gapFix+infoAdd+revertCount+liveChecked+dateGuard+gapSepFix folded in, ' + Object.keys(SRC).length +
+  window.__deisVersion = 'DEIS complete 3.9 (self-updating from GitHub) - popup fix ON, patientName+clearSafe+plan-visibility+preSave+gapFix+infoAdd+revertCount+liveChecked+dateGuard+gapSepFix+setOneGuard+infoAppendFix+hScrollFix folded in, ' + Object.keys(SRC).length +
     ' modules + ' + Object.keys(ACRO).length + ' acronyms, seeded ' + new Date().toLocaleTimeString();
 })();
