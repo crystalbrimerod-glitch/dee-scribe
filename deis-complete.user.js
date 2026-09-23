@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DEIS - AdvancedMD scribe, complete
 // @namespace    dryeye.institute
-// @version      3.9
+// @version      3.10
 // @description  Everything one machine needs: opens the EHR as a tab instead of a popup, and carries the whole scribe library, re-seeding it on every page load. Self-updating from GitHub (crystalbrimerod-glitch/dee-scribe).
 // @match        *://*.advancedmd.com/*
 // @run-at       document-start
@@ -31,6 +31,52 @@
 
    WHOEVER CONTROLS THAT URL RUNS CODE ON PAGES WITH PATIENT CHARTS OPEN. It
    belongs on CB's own account and nowhere else.
+
+   v3.10, 9/23/2026 - one real, root-caused bug fixed; the rest of tonight's
+   9/22/2026 incident reports (three separate room chats) are OPEN, FLAGGED,
+   and deliberately NOT guessed at - see never-regress-ledger.md's 9/23/2026
+   entry for the full write-up of everything below, patient by patient.
+
+   FIXED: the PT CC symptom-splitter (deis-cc.js's symsIn, deis-auto.js's
+   syms - two copies of the same lexicon) matched every SYM keyword as a
+   PLAIN SUBSTRING with no word-boundary check. The short keyword 'red'
+   (meant for "redness") matched inside "Blurred" (b-l-u-r-R-E-D), so a
+   Secondary complaint reading "Blurred" was counted as two symptoms and
+   kept re-inserting a false "[ ] SPLIT:" warning every time it was cleared
+   - reproduced live on Dorothy Pittman-Taylor's chart, 9/22/2026. Fixed by
+   requiring a word boundary immediately before each keyword match. This is
+   a real behavior change for any OTHER keyword that depended on matching
+   mid-word (e.g. 'crust' inside "encrusted", 'ache' inside "headache" no
+   longer match) - not possible to verify against every real dictation
+   phrase without live testing; flag it if a previously-caught phrase stops
+   being detected.
+
+   DOCUMENTED, NOT CODE-CHANGED: __planSection(label, text) replaces
+   starting AT the label's own position through the next blank line. If a
+   caller nests a new line under an existing header without re-including
+   the header itself in the text argument, the header gets deleted - this
+   is what happened to Marlene Melworm's plan box tonight (a duplicated,
+   mislabeled block resulted from the fix attempt). Not changing the
+   function itself - it is relied on elsewhere exactly as written -
+   documented as a call-site rule in deis-core.js and
+   procedure-day-protocol.md instead.
+
+   STILL OPEN, HIGH PRIORITY, NOT GUESSED AT: a family of note/tab-binding
+   symptoms reported across (at least) three separate room chats tonight -
+   a grid finding silently changing with nothing in the calling spec
+   touching it, a note stuck on a month-old date for half a visit, a write
+   landing in an unrelated tab, content from one patient's chart appearing
+   in a different patient's chart, and a tab repeatedly, unpromptedly
+   reverting to ANTERIOR OU. These all look like the same underlying
+   binding-fragility problem the 9/15/2026 date guard was built for, but
+   none of tonight's specific instances has been root-caused, and no patch
+   is being guessed here. Needs a deliberate, unhurried investigation on
+   TESTY with two-plus notes open, not another live guess. Also open: a
+   recurring "box not found" failure for PT CC onset/percent number fields,
+   hitting three patients in a row tonight (this is the SAME unresolved
+   __ccNum flag first raised 9/8/2026 - tonight shows it is frequent, not
+   rare) and the Patient-Reports-Using duplicate-content pattern noted in
+   deis-gap.js's own top comment.
 
    v3.9, 9/16/2026 - FOUR real bugs fixed, all reproduced live on 9/15/2026 across
    three different exam-room chats (EXAM ROOM 1/myboyblue, EXAM ROOM 2, EXAM ROOM 3)
@@ -802,7 +848,17 @@
      close the hole - two VISIBLE textareas both matching the regex are still
      possible in principle - but it closes the exact failure observed, and a
      visible-candidate check is now the standing rule for verifying any
-     __planBox binding (see never-regress-ledger.md).                       */
+     __planBox binding (see never-regress-ledger.md).
+
+     __planSection(label, text) - READ THIS BEFORE CALLING IT (see the
+     9/23/2026 top-of-file entry): it REPLACES starting at `label`'s own
+     position through the next blank line, with `text`. If you want to nest
+     a new line UNDER an existing header/category without disturbing that
+     header, `text` MUST include the header itself as its own first line -
+     passing only the new line to add deletes the header. This is exactly
+     what went wrong on Marlene Melworm's chart, 9/22/2026 (see the ledger).
+     Not changed here because other callers already rely on the current
+     replace behavior; this is a call-site rule, not a bug being fixed.    */
   window.__plan = function(){
     var cands = [].slice.call(d.querySelectorAll('textarea'))
       .filter(function(e){ return /FOLLOW UP|TODAY:|SUMMARY:/i.test(e.value); });
@@ -1406,8 +1462,22 @@
   var SYM = ['burn','itch','sting','pain','red','tear','water','dry','blur','fluctuat','grit','sandy',
     'foreign body','light sensit','photophob','crust','discharge','mucus','swell','heavy','tired',
     'ache','pressure','film','glare','halo'];
-  function symsIn(s){ var l = String(s).toLowerCase(); return SYM.filter(function(k){ return l.indexOf(k) >= 0; }); }
+  // FIXED 9/23/2026 - see the top-of-file entry. Requires a word boundary
+  // immediately before each keyword so a short/generic entry like 'red'
+  // cannot match as a mid-word substring (e.g. inside "Blurred").
+  function symsIn(s){
+    var l = String(s).toLowerCase();
+    return SYM.filter(function(k){
+      return new RegExp('\\b' + k.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).test(l);
+    });
+  }
 
+  /* ---- map the tab --------------------------------------------------------
+     Everything is measured inside this call. The three blocks are bands running
+     from one "… Issue Today:" header to the next; radio groups are identified by
+     their OPTION LABELS (OD / Better / weeks / intermittent / minutes), which are
+     real words here — unlike the exam grid, where labels lie and only geometry
+     works. Text fields are found from their label, never from a stored x.     */
   window.__cc = function(){
     var leaves = [];
     [].slice.call(d.querySelectorAll('*')).forEach(function(el){
@@ -1424,6 +1494,12 @@
       return {e:e, x:b.left, y:b.top, w:b.width, r:b.right, vis:b.width > 0};
     }).filter(function(c){ return c.vis; });
 
+    // A label element can be much WIDER than its text, so measuring from its
+    // right edge silently rejected the real field (3 of 6 right-column fields
+    // missed on the first run). Measure from its LEFT edge instead.
+    // Row tolerance is 12px, NOT 26: "% improvement since last treatment" and
+    // "since the beginning" are 20px apart, and 26 made the second one grab the
+    // first one's box — it read 5 when the chart said 10.
     function nearRight(labelRe, lo, hi, want){
       var L = leaves.filter(function(l){ return labelRe.test(l.t) && l.y >= lo && l.y < hi; })[0];
       if (!L) return null;
@@ -1461,6 +1537,11 @@
         assoc:  nearRight(/^Associated Factors:?$/i, lo, hi, ['INPUT'])
       };
     });
+    // NO Y WINDOWS. These were originally scoped to fixed screen bands taken from
+    // one scroll position, and every one of them returned null the moment the pane
+    // was scrolled differently — gap, sinceLast and sinceBegin all vanished
+    // mid-dictation on 9/4/2026. The labels are unique; scope by text alone.
+    // "Coordinates die between calls" applies INSIDE the mapper too.
     var R = {
       discomfort: nearRight(/^Overall discomfort:?$/i, -1e6, 1e6, ['SELECT']),
       gap:        nearRight(/gap between where you are NOW/i, -1e6, 1e6, ['INPUT']),
@@ -1469,6 +1550,12 @@
       past:       nearRight(/^Past Issues:?$/i, -1e6, 1e6, ['TEXTAREA','INPUT']),
       agenda:     nearRight(/^Today's Agenda:?$/i, -1e6, 1e6, ['TEXTAREA','INPUT'])
     };
+    // THE VISIT-LEVEL RIGHT COLUMN IS ON A SECOND SUB-TAB (div#tab2) INSIDE PT CC.
+    // When that sub-tab is closed the whole right column is display:none and every
+    // field above comes back null — discovered 9/4/2026 after three failed writes.
+    // If they are null, click the PT CC sub-tab link (a[href="#tab2"]) and re-map:
+    //     var a = d.querySelector('a[href="#tab2"]'); if (a) a.click();
+    // then window.__cc() again. Do not conclude the fields are missing.
     window.__CC = { blocks: blocks, right: R };
     return window.__san('CC mapped | ' + blocks.map(function(b){
       return b.name + '[box ' + (b.box?'y':'-') + ' none ' + (b.none?'y':'-') +
@@ -1480,9 +1567,16 @@
   };
 
   function need(){ if (!window.__CC) window.__cc(); return window.__CC; }
+  // route every write through core's journal so __revert() undoes it
   function setV(e, v){ if (window.__setVal) window.__setVal(e, v); else { e.value = v; e.dispatchEvent(new Event('change',{bubbles:true})); } }
   function anySet(g){ return !!(g && g.some(function(r){ return r.checked; })); }
 
+  /* ---- destray -------------------------------------------------------------
+     Relief / Associated-factors prose typed into the complaint box moves to its
+     real field. Existing field content is APPENDED to, never overwritten. If a
+     target field cannot be found the line stays in the box and the report says
+     so. Always runs before __ccSplit — splitting on un-destrayed Relief lines
+     produced garbage the first time it was tried.                            */
   window.__ccDestray = function(apply){
     var C = need(); if (typeof C === 'string') return C;
     var rep = [];
@@ -1516,6 +1610,12 @@
     return window.__san(rep.length ? rep.join('\n') : 'no stray Relief / Associated lines');
   };
 
+  /* ---- assess --------------------------------------------------------------
+     Empty block -> check None (the chart must distinguish "no third problem"
+     from "nobody asked"). Non-empty -> prepend "[ ] ASK:" naming ONLY the radio
+     groups actually unset, and "[ ] SPLIT:" when more than one symptom word is
+     present. Idempotent: strips its own prior lines first. scrollTop = 0 after
+     writing, or the tech reads the second line instead of the prompt.        */
   window.__ccAssess = function(apply){
     var C = need(); if (typeof C === 'string') return C;
     window.__ccDestray(apply);
@@ -1554,6 +1654,12 @@
     return window.__san(rep.join('\n'));
   };
 
+  /* ---- the number checks ---------------------------------------------------
+     CB, 8/31: "% improvement from beginning and gap should equal ~100 and if the
+     gap is high the discomfort number should be high, if the gap is low then the
+     discomfort low." Tolerances confirmed by her: 15 on the total, 3 on severity.
+     The TINT matters more than any banner — a banner disappears, red boxes are
+     still there when CB walks in.                                            */
   window.__ccTint = function(el, on){
     if (!el) return;
     if (on){ el.style.outline = '2px solid #d33'; el.style.background = '#ffe9ef'; }
@@ -1590,6 +1696,7 @@
     return window.__san(have.join('') + '\n' + (bad.length ? bad.map(function(b){ return 'FLAG: ' + b.m; }).join('\n') : 'numbers agree'));
   };
 
+  /* ---- past issues: COPY, never move -------------------------------------*/
   window.__ccPastIssue = function(text, apply){
     var C = need(); if (typeof C === 'string') return C;
     var f = C.right.past;
@@ -1602,6 +1709,17 @@
     return window.__san('Past Issues to "' + nv.slice(0,80) + '"' + (apply ? '' : '  (dry run)'));
   };
 
+  /* ---- __ccSet: write one issue block from dictation -----------------------
+     Added 9/4/2026. There was no writer for these fields at all — the module
+     could map, assess and check numbers but not record what CB actually said,
+     so the first live dictation had to be written by hand.
+       __ccSet(0, {lat:'OU', dir:'Better', pct:25, onsetN:2, onsetU:'years',
+                   freq:'daily', durN:20, durU:'minutes',
+                   relief:'tears and Allegra', assoc:'air conditioning',
+                   text:'burning'})
+     Radios are journaled through __setChk so __revert() undoes them.
+     LATERALITY: only ever pass `lat` when CB SAID an eye. Never infer it from
+     the complaint text, and never from last visit's carried-forward wording. */
   function optLabOf(el){
     var n = el.nextSibling, s = '';
     while (n && s.length < 30){
@@ -1619,6 +1737,10 @@
     else { hit.checked = true; hit.dispatchEvent(new Event('change',{bubbles:true})); }
     return what + ' = ' + want;
   }
+  // The small number box sits on the same row, immediately LEFT of its radio
+  // group. Measure from the group's LEFTMOST radio: group[0] is DOM order, not
+  // screen order, and using it put the reference on the last option so every
+  // number box fell outside range and silently reported NOT FOUND.
   window.__ccNum = function(group){
     if (!group) return null;
     var rects = group.map(function(r){ return r.getBoundingClientRect(); }).filter(function(b){ return b.width; });
@@ -1834,6 +1956,10 @@
     // for dose lookups, and then just vanished from the regenerated box.
     // Now: re-append it verbatim and say so, so the worst case is "ugly and
     // flagged" instead of "clean and silently missing content."
+    // FLAGGED 9/23/2026 - see the top-of-file entry: this safety net is the
+    // leading hypothesis for tonight's "written with the checkbox plus
+    // written below that" duplicate-content complaints, but it is NOT
+    // confirmed - do not change this logic from a description alone.
     if (st.other && st.other.length){
       st.other.forEach(function(it){
         lines.push(it.full);
@@ -1986,9 +2112,20 @@
   var SYM = ['burn','itch','sting','pain','red','tear','water','dry','blur','fluctuat','grit','sandy',
     'foreign body','light sensit','photophob','crust','discharge','mucus','swell','heavy','tired',
     'ache','pressure','film','glare','halo'];
-  function syms(s){ var l = String(s).toLowerCase(); return SYM.filter(function(k){ return l.indexOf(k) >= 0; }); }
+  // FIXED 9/23/2026 - see the top-of-file entry. Same fix as deis-cc.js's
+  // symsIn(): require a word boundary before each keyword.
+  function syms(s){
+    var l = String(s).toLowerCase();
+    return SYM.filter(function(k){
+      return new RegExp('\\b' + k.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).test(l);
+    });
+  }
   function setV(e,v){ if (window.__setVal) window.__setVal(e,v); else { e.value=v; e.dispatchEvent(new Event('change',{bubbles:true})); } }
 
+  /* ---- __ccSplit: one problem per box ------------------------------------
+     Destrays FIRST, always - the first version of this split ran on a fresh
+     note where destray had not happened, split on the Relief lines and produced
+     garbage.                                                                */
   window.__ccSplit = function(apply){
     if (!window.__CC) window.__cc();
     var C = window.__CC; if (typeof C === 'string' || !C) return 'PT CC not mapped';
@@ -2000,10 +2137,10 @@
     var parts = body.split(/\s*(?:,|;|\band\b|\.)\s*/i).map(function(x){ return x.trim(); }).filter(Boolean);
     var cl = [];
     parts.forEach(function(p){
-      if (!syms(p).length && cl.length){ cl[cl.length-1] += ' ' + p; return; }
+      if (!syms(p).length && cl.length){ cl[cl.length-1] += ' ' + p; return; }   // no symptom word - glue back
       cl.push(p);
     });
-    if (cl.length > 1 && !syms(cl[0]).length){ cl[1] = cl[0] + ' ' + cl[1]; cl.shift(); }
+    if (cl.length > 1 && !syms(cl[0]).length){ cl[1] = cl[0] + ' ' + cl[1]; cl.shift(); }  // "Pt reports" merges forward
     var rep = ['clauses: ' + cl.length];
     cl.forEach(function(text, i){
       var lat = /\bright eye\b|\bOD\b/i.test(text) ? 'OD' : (/\bleft eye\b|\bOS\b/i.test(text) ? 'OS' : (/\bboth eyes\b|\bOU\b/i.test(text) ? 'OU' : null));
@@ -2029,6 +2166,7 @@
       if (subset){ rep.push(Tb.name + ' replaced "' + cur.slice(0,26) + '" with the fuller "' + text.slice(0,34) + '"' + tag); if (apply) setV(Tb.box, text); }
       else rep.push(Tb.name + ' OCCUPIED by "' + cur.slice(0,34) + '" - clause NOT moved: "' + text.slice(0,34) + '"' + tag);
     });
+    // relief entries follow their own problem
     var P = C.blocks[0];
     if (P.relief && String(P.relief.value).trim() && cl.length > 1){
       var ents = String(P.relief.value).split(/\s*;\s*/).filter(Boolean), stay = [];
@@ -2047,6 +2185,9 @@
     return window.__san(rep.join('\n') + '\nLATERALITY IS NEVER AUTO-SET - CB or the tech sets the eye.');
   };
 
+  /* ---- encounter clock ---------------------------------------------------
+     AdvancedMD's OWN Time Elapsed timer on the Info tab. Use it, do not build
+     one. Start it when the note opens; NEVER stop or reset it; never Sign.  */
   window.__clock = async function(){
     var t = await window.__tabWait('Info', 'Time Elapsed', 5000);
     if (/TIMEOUT|NOT FOUND/.test(t)) return 'CLOCK: could not reach the Info tab - ' + t;
@@ -2075,8 +2216,18 @@
     return window.__san('CLOCK: started, was ' + was + '. Never stop or reset it.');
   };
 
+  /* ---- arming ------------------------------------------------------------*/
+  // Gap report: once per note, on the ANTERIOR OU click. No speed bump - the
+  // tab switch must always go through.
   window.__armGap = function(){
     if (w.__gapArmed) return 'gap already armed';
+    // Attach to the DOCUMENT, capture phase. The first version keyed off the
+    // first 'li > a' in the DOM and attached to its container - which is the
+    // TOOLBAR list (Save / Cancel / Review / Sign / New...), NOT the note's tab
+    // strip. The ANTERIOR OU click never passed through it and NOTHING FIRED,
+    // while __armGap still cheerfully reported "armed".
+    // Caught 9/3/2026 only because the click was simulated instead of trusted.
+    // NEVER call an event handler done because it installed without throwing.
     d.addEventListener('click', function(ev){
       try {
         var a = ev.target && ev.target.closest ? ev.target.closest('a') : null;
@@ -2090,10 +2241,15 @@
     w.__gapArmed = true;
     return 'gap armed - fires once per note on the ANTERIOR OU click';
   };
+  // PT CC: assess 30 s after the tech's first keystroke in Primary.
   window.__ccWatch = function(sec){
     if (!window.__CC) window.__cc();
     var C = window.__CC;
     if (typeof C === 'string' || !C){
+      // PT CC is not the visible tab, so its fields cannot be measured and the
+      // watch cannot attach yet. Returning "not mapped" and moving on is WHY the
+      // 30-second assess never armed in normal use — startup almost never lands
+      // on PT CC. Observed 9/4/2026. Arm it the first time that tab is opened.
       if (!w.__ccPending){
         w.__ccPending = true;
         d.addEventListener('click', function(){
@@ -2118,6 +2274,12 @@
     P.box.addEventListener('input', function(){
       try { if (t) return; t = setTimeout(function(){ t = null; try { window.__ccLast = window.__ccReport(true); } catch(e){} }, ms); } catch(e){}
     });
+    // CB 9/4/2026 item 2 - do not rely on the tech.
+    //  a) the ASK line has to disappear BY ITSELF once the fields are filled.
+    //     The old watch listened only for 'input' on the PRIMARY BOX, but a tech
+    //     filling a radio or a select fires 'change' on a different element, so
+    //     the ASK line survived every single time.
+    //  b) the moment anyone types NEW info for today, tick Today's report.
     var fire = function(){
       try { window.__ccToday(); } catch(e){}
       if (t) return;
@@ -2137,6 +2299,13 @@
     }
     return 'watch armed - ticks Today report on the first edit, then re-assesses ' + (sec||30) + 's later (drops the ASK line by itself)';
   };
+  // Leaving PT CC with gaps cancels ONE click, runs the cleanup and tints.
+  // A hard block is the wrong tool - one false positive and the tech cannot
+  // leave the tab at all. The TINT is what matters: the banner disappears, the
+  // red boxes do not, so the gap is still visible when CB walks in.
+  // CB 9/4/2026: tick Today's report automatically when new info is typed for today.
+  // The checkbox sits immediately LEFT of the 'Today's report' label on the same row,
+  // on PT CC sub-tab #tab2. Geometry only - there is no usable name or id.
   window.__ccToday = function(force){
     if (w.__ccTodayDone && !force) return 'already ticked';
     var lbl = [].slice.call(d.querySelectorAll('*')).filter(function(e){
@@ -2163,8 +2332,8 @@
         var a = ev.target && ev.target.closest ? ev.target.closest('a') : null;
         if (!a) return;
         if (!window.__CC || !window.__CC.blocks[0] || !window.__CC.blocks[0].box) return;
-        if (!window.__CC.blocks[0].box.getBoundingClientRect().width) return;
-        if (w.__ccPass && Date.now() - w.__ccPass < 8000) return;
+        if (!window.__CC.blocks[0].box.getBoundingClientRect().width) return;   // not on PT CC
+        if (w.__ccPass && Date.now() - w.__ccPass < 8000) return;               // second click always passes
         var r = window.__ccReport(true);
         var n = (String(r).match(/unanswered/g) || []).length;
         var f = (String(r).match(/FLAG:/g) || []).length;
@@ -2416,57 +2585,57 @@
 }).toString() + ')()';
 
   var ACRO = {
-"WAT0": "GOOD. Continue high water intake",
-"WAT1": "OK. Maintain higher water intake, at least half your body weight in ounces per day.",
-"WAT2": "LOW water volume. DRINK MORE WATER, at least half your body weight in ounces per day. Consider DRY EYE DRINK: HELPS YOU ABSORB NUTRIENTS FROM WATER. It makes 1 bottle of water absorb as if it were 3 bottles of water. Dry Eye Drink has ELECTROLYTES, ANTI-INFLAMMATORIES, and SUPPLEMENTS that help dry eye, BUT NO SUGAR.\nPM VERSION: also contains melatonin, valerian root, chamomile to help you relax and sleep.",
-"DEB0": "Tear Film is clean! Continue current cleaning routine.",
-"DEB1": "MINIMAL DEBRIS! Continue current cleaning routine.",
-"DEB2": "MODERATE DEBRIS.\n> PURE AND CLEAN DROPS: INSERT 2-3 DROPS IN EACH EYE AND RUB EXCESS INTO LASHES. LET DRY COMPLETELY. REPEAT AT LEAST 2-4 X DAILY",
-"DEB3": "SIGNIFICANT DEBRIS!\n> Flood a heavy stream of eyewash over your eyes morning and night (and as desired) to rinse off allergens/ remove tear film debris.\n> PURE AND CLEAN DROPS: INSERT 2-3 DROPS IN EACH EYE AND RUB EXCESS INTO LASHES. LET DRY COMPLETELY. REPEAT AT LEAST ~4 X DAILY",
-"PNC": "PURE AND CLEAN DROPS: INSERT 2-3 DROPS IN EACH EYE AND RUB EXCESS INTO LASHES. LET DRY COMPLETELY. REPEAT AT LEAST 2-4 X DAILY",
-"PNCQ": "Apply Pure and Clean to the lower lid's waterline with a Qtip 1-2 times per day.",
-"IWASH": "Flood a heavy stream of eyewash over your eyes morning and night (and as desired) to rinse off allergens / remove tear film debris.",
-"RINS": "In-office Rinsada: Powerwash for the superior and inferior cul de sacs to reduce inflammatory contributors.",
-"LAC": "Lacrimal Sac Irrigation: A tiny cannula is inserted into the puncta (exit pipe) of the lid and saline is flushed internally to rinse out contaminants and inflammatory proteins within the drainage system in order to reduce mucous production and secondary inflammation on the ocular surface.",
-"OIL0": "OIL is coming out with the blink!!\n> Continue current routine with supplements, Nulids, and blink exercises.",
-"OIL1": "OIL IS COMING OUT WTH FORCED EXPRESSION BUT NOT WITH THE BLINK. NEED FIRMER BLINKS!\n> Do BLINK Exercises! Close and push down. Do NOT use your forehead! The key is remembering to do it throughout the day. PAIR the blink exercise with ONE thing that you do constantly throughout the day: Ex. every sip of water, phone check, email, TV Commercial, stoplight.",
-"OIL2": "Your oil glands are not expressing oil when you blink (no rainbow on the video), because the oil is too thick a/o some glands are clogged.\n\nPLAN:\n> Do BLINK Exercises! Close and push down. Do NOT use your forehead! The key is remembering to do it throughout the day. PAIR the blink exercise with ONE thing that you do constantly throughout the day: Ex. every sip of water, phone check, email, TV Commercial, stoplight.\n> Eat more GOOD FATS: WILD CAUGHT OILY FISH 2/WEEK, NUTS, SEEDS: HEMP SEED, chia seed, flax seed, olive oil, walnut, avocado.",
-"BLI": "Do BLINK Exercises! Close and push down. Do NOT use your forehead! The key is remembering to do it throughout the day. PAIR the blink exercise with ONE thing that you do constantly throughout the day: Ex. every sip of water, phone check, email, TV Commercial, stoplight.",
-"OILOP": "OPTIONS:\n> Add another supplement: HYDROEYES (black current seed oil) 4 pills/ day\n> Increase PRN DE3 to 4 pills/ day\n> Add Rx oral antibiotic such as Azythromycin 1000 mg weekly x 4 weeks or Doxycycline 50 mg twice daily for ~90 days\n> Nulids twice per day (precede with heat when able)\n> Melt clogs with Tixel externally (3 treatments, 2 weeks apart) or evacuate the glands with Lipiflow (1 treatment)",
-"NUM": "Nulids > massage the upper and lower lid close to the lash line. Keep the wheel flat and use firm pressure for 30 seconds each at least once a day",
-"NUWC": "NULIDS once or twice daily, immediately after warm compress mask, while lids are still warm",
-"NUCL": "Nulids cleaning technique: Using the edge of the wheel, clean along the upper and lower lash lines adjacent to the base of the eyelashes for 15 seconds. Then pull down the lower lid and do 2 passes on the lower waterline.",
-"NUINS": "30 seconds top, 30 seconds bottom, flush to the lid with steady/firm pressure then go back and angle the wheel to clean at base of lashes",
-"INCNU": "INCREASE NULIDS to TWICE daily when able (while lids are still warm after warm compress mask)",
-"INF0": "STABLE/ IMPROVED!",
-"INF1": "MINIMAL / PERSISTENT",
-"INF2": "MODERATE. NEED BETTER INFLAMMATORY CONTROL.",
-"INF3": "SEVERE INFLAMMATION: NEED BETTER INFLAMMATORY CONTROL.",
-"INFOP": "OPTIONS:\n> Add a long term immunomodulator drop such as Restasis, Cequa, Xiidra, or Vevy twice per day\n> Add a feel good drop that also protects the cornea: Miebo 4 times per day\n> Add a tear made from your blood\n> Return for Prokera placement: A frozen amniotic membrane to help the cornea grow nerve and stem cells\n> Add an oral drug off label that is known to reduce inflammation: Low Dose Naltrexone 3 mg",
-"SPK0": "NONE!",
-"SPK1": "MINIMAL / PERSISTENT",
-"SPK2": "MODERATE CORNEAL STAINING. NEED BETTER CONTROL / MORE AGGRESSIVE REGIMEN",
-"SPK3": "SIGNIFICANT/ PERSISTENT CORNEAL STAINING/ PUNCTATE EPITHELIAL EROSIONS.\nNEED BETTER CONTROL / MORE AGGRESSIVE REGIMEN",
-"NK": "NEUROTROPHIC KERATITIS",
-"pNK": "NEUROTOPHIC KERATITIS: Your corneal nerves are absent or low functioning. This causes decreased water/oil pump and blink function. It also causes the cornea to be more fragile and prone to damage / epithelial erosions.",
-"NKOP": "OPTIONS:\n> Autologous Blood Serum tears made from your own blood\n> Placement of a frozen amniotic membrane over the cornea for 5 days to act as fertilizer to grow corneal nerves.\n> If additional treatment is needed, OXERVATE is an 8 week course of man made NERVE GROWTH FACTOR, used evert 2 hours during the day",
-"pLIP": "Advise Lipiflow as a safe and effective treatment to evacuate the clogged meibomian glands in order to prevent further gland loss and help improve flow of the oil into the tear film.",
-"LIPI": "LIPIFLOW: Heat is administered under the lids with simultaneous external massage for 12 minutes to EVACUATE OIL GLANDS.",
-"IPLS": "Intense Pulsed Light (IPL) with Radiofrequency (RF): 1 session every 2-4 weeks for 4 sessions and then a booster every ~6 months",
-"IPL6": "RTC for 6 month BOOSTER IPL treatment for maintenance.",
-"TIXi": "TIXELi: An in-office procedure using HEAT to melt the clogs within the OIL GLANDS. No numbing or corneal shields, takes only 2 minutes to perform. THREE WEEKS apart.",
-"TIXL": "TIXEL: HEAT to create channels to the DERMIS layer. We will tighten your lower lid and reduce the excess skin/hooding above your upper lid. THIS WILL PREPARE YOU FOR BETTER BLINK FUNCTION, however it still takes PRACTICE! Arrive 30 minutes early for NUMBING CREAM. DISCONTINUE Retinols ~5 days beforehand. EXPECT SWELLING FOR 24-72 HOURS AND a faint GRID appearance in areas.",
-"TIXF": "TIXEL: serums specific to the issue (redness, scar smoothing, hooding, under eye bags, lower lid tightening, volumizing, etc). Arrive 30 minutes early for NUMBING CREAM. DISCONTINUE Retinols beforehand. EXPECT SWELLING FOR 24-72 HOURS AND a faint GRID appearance in areas.",
-"PLUOP": "> CONISDER PUNCTAL PLUGS: Plugging the drainage canal. These buried plugs are made of collagen and will dissolve within 6 months.",
-"PLU": "KSICCA: plugs",
-"SBH": "SBH Hydroeyes 4x /day",
-"INCPRN": "INCREASE PRN DE3 TO 4/DAY",
-"EXPOS": "EXPOSURE DURING NIGHT CAUSING DRYNESS AT WAKE UP\n> Add Eyeseals Sleep Mask (and Hylo PM ointment if still waking up dry)",
-"LAG": "EYE SEAL MASK a/o use press and seal over eyes at night. (add HYLO PM ointment if still waking up dry)",
-"EAT": "Eat more GOOD FATS: WILD CAUGHT OILY FISH 2/WEEK, NUTS, SEEDS: HEMP SEED, chia seed, flax seed, olive oil, walnut, avocado. <SEE LIST IN THE BOOK>",
-"DED": "DRY EYE DRINK HELPS YOU ABSORB NUTRIENTS FROM WATER. It makes 1 water absorb as if it were 3 bottles of water. Dry Eye Drink has ELECTROLYTES, ANTIINFLAMMATORIES, and SUPPLEMENTS that help dry eye, BUT NO SUGAR.\nPM VERSION: with melatonin, valerian root, chamomile to help you relax and sleep.",
-"LLTT": "LOW LEVEL LIGHT THERAPY (BIOPHOTOMODULATION): RED and INFRARED help reduce inflammation BLUE helps with rosacea. YELLOW helps with lymphatic drainage and allergies. ALL FOUR COLORS are used at once for 15 minutes, twice per week for 3 weeks. ONE session is needed as a BOOSTER EVERY ~3 MONTHS to maintain results.",
-"OILNERVES": "DO NOTHING for the nerves, but EVACUATE GLANDS to get more oil on the surface to protect the surface from damage."
+"WAT0":"GOOD. Continue high water intake",
+"WAT1":"OK. Maintain higher water intake, at least half your body weight in ounces per day.",
+"WAT2":"LOW water volume. DRINK MORE WATER, at least half your body weight in ounces per day. Consider DRY EYE DRINK: HELPS YOU ABSORB NUTRIENTS FROM WATER. It makes 1 bottle of water absorb as if it were 3 bottles of water. Dry Eye Drink has ELECTROLYTES, ANTI-INFLAMMATORIES, and SUPPLEMENTS that help dry eye, BUT NO SUGAR.\nPM VERSION: also contains melatonin, valerian root, chamomile to help you relax and sleep.",
+"DEB0":"Tear Film is clean! Continue current cleaning routine.",
+"DEB1":"MINIMAL DEBRIS! Continue current cleaning routine.",
+"DEB2":"MODERATE DEBRIS.\n> PURE AND CLEAN DROPS: INSERT 2-3 DROPS IN EACH EYE AND RUB EXCESS INTO LASHES. LET DRY COMPLETELY. REPEAT AT LEAST 2-4 X DAILY",
+"DEB3":"SIGNIFICANT DEBRIS!\n> Flood a heavy stream of eyewash over your eyes morning and night (and as desired) to rinse off allergens/ remove tear film debris.\n> PURE AND CLEAN DROPS: INSERT 2-3 DROPS IN EACH EYE AND RUB EXCESS INTO LASHES. LET DRY COMPLETELY. REPEAT AT LEAST ~4 X DAILY",
+"PNC":"PURE AND CLEAN DROPS: INSERT 2-3 DROPS IN EACH EYE AND RUB EXCESS INTO LASHES. LET DRY COMPLETELY. REPEAT AT LEAST 2-4 X DAILY",
+"PNCQ":"Apply Pure and Clean to the lower lid's waterline with a Qtip 1-2 times per day.",
+"IWASH":"Flood a heavy stream of eyewash over your eyes morning and night (and as desired) to rinse off allergens / remove tear film debris.",
+"RINS":"In-office Rinsada: Powerwash for the superior and inferior cul de sacs to reduce inflammatory contributors.",
+"LAC":"Lacrimal Sac Irrigation: A tiny cannula is inserted into the puncta (exit pipe) of the lid and saline is flushed internally to rinse out contaminants and inflammatory proteins within the drainage system in order to reduce mucous production and secondary inflammation on the ocular surface.",
+"OIL0":"OIL is coming out with the blink!!\n> Continue current routine with supplements, Nulids, and blink exercises.",
+"OIL1":"OIL IS COMING OUT WTH FORCED EXPRESSION BUT NOT WITH THE BLINK. NEED FIRMER BLINKS!\n> Do BLINK Exercises! Close and push down. Do NOT use your forehead! The key is remembering to do it throughout the day. PAIR the blink exercise with ONE thing that you do constantly throughout the day: Ex. every sip of water, phone check, email, TV Commercial, stoplight.",
+"OIL2":"Your oil glands are not expressing oil when you blink (no rainbow on the video), because the oil is too thick a/o some glands are clogged.\n\nPLAN:\n> Do BLINK Exercises! Close and push down. Do NOT use your forehead! The key is remembering to do it throughout the day. PAIR the blink exercise with ONE thing that you do constantly throughout the day: Ex. every sip of water, phone check, email, TV Commercial, stoplight.\n> Eat more GOOD FATS: WILD CAUGHT OILY FISH 2/WEEK, NUTS, SEEDS: HEMP SEED, chia seed, flax seed, olive oil, walnut, avocado.",
+"BLI":"Do BLINK Exercises! Close and push down. Do NOT use your forehead! The key is remembering to do it throughout the day. PAIR the blink exercise with ONE thing that you do constantly throughout the day: Ex. every sip of water, phone check, email, TV Commercial, stoplight.",
+"OILOP":"OPTIONS:\n> Add another supplement: HYDROEYES (black current seed oil) 4 pills/ day\n> Increase PRN DE3 to 4 pills/ day\n> Add Rx oral antibiotic such as Azythromycin 1000 mg weekly x 4 weeks or Doxycycline 50 mg twice daily for ~90 days\n> Nulids twice per day (precede with heat when able)\n> Melt clogs with Tixel externally (3 treatments, 2 weeks apart) or evacuate the glands with Lipiflow (1 treatment)",
+"NUM":"Nulids > massage the upper and lower lid close to the lash line. Keep the wheel flat and use firm pressure for 30 seconds each at least once a day",
+"NUWC":"NULIDS once or twice daily, immediately after warm compress mask, while lids are still warm",
+"NUCL":"Nulids cleaning technique: Using the edge of the wheel, clean along the upper and lower lash lines adjacent to the base of the eyelashes for 15 seconds. Then pull down the lower lid and do 2 passes on the lower waterline.",
+"NUINS":"30 seconds top, 30 seconds bottom, flush to the lid with steady/firm pressure then go back and angle the wheel to clean at base of lashes",
+"INCNU":"INCREASE NULIDS to TWICE daily when able (while lids are still warm after warm compress mask)",
+"INF0":"STABLE/ IMPROVED!",
+"INF1":"MINIMAL / PERSISTENT",
+"INF2":"MODERATE. NEED BETTER INFLAMMATORY CONTROL.",
+"INF3":"SEVERE INFLAMMATION: NEED BETTER INFLAMMATORY CONTROL.",
+"INFOP":"OPTIONS:\n> Add a long term immunomodulator drop such as Restasis, Cequa, Xiidra, or Vevy twice per day\n> Add a feel good drop that also protects the cornea: Miebo 4 times per day\n> Add a tear made from your blood\n> Return for Prokera placement: A frozen amniotic membrane to help the cornea grow nerve and stem cells\n> Add an oral drug off label that is known to reduce inflammation: Low Dose Naltrexone 3 mg",
+"SPK0":"NONE!",
+"SPK1":"MINIMAL / PERSISTENT",
+"SPK2":"MODERATE CORNEAL STAINING. NEED BETTER CONTROL / MORE AGGRESSIVE REGIMEN",
+"SPK3":"SIGNIFICANT/ PERSISTENT CORNEAL STAINING/ PUNCTATE EPITHELIAL EROSIONS.\nNEED BETTER CONTROL / MORE AGGRESSIVE REGIMEN",
+"NK":"NEUROTROPHIC KERATITIS",
+"pNK":"NEUROTOPHIC KERATITIS: Your corneal nerves are absent or low functioning. This causes decreased water/oil pump and blink function. It also causes the cornea to be more fragile and prone to damage / epithelial erosions.",
+"NKOP":"OPTIONS:\n> Autologous Blood Serum tears made from your own blood\n> Placement of a frozen amniotic membrane over the cornea for 5 days to act as fertilizer to grow corneal nerves.\n> If additional treatment is needed, OXERVATE is an 8 week course of man made NERVE GROWTH FACTOR, used evert 2 hours during the day",
+"pLIP":"Advise Lipiflow as a safe and effective treatment to evacuate the clogged meibomian glands in order to prevent further gland loss and help improve flow of the oil into the tear film.",
+"LIPI":"LIPIFLOW: Heat is administered under the lids with simultaneous external massage for 12 minutes to EVACUATE OIL GLANDS.",
+"IPLS":"Intense Pulsed Light (IPL) with Radiofrequency (RF): 1 session every 2-4 weeks for 4 sessions and then a booster every ~6 months",
+"IPL6":"RTC for 6 month BOOSTER IPL treatment for maintenance.",
+"TIXi":"TIXELi: An in-office procedure using HEAT to melt the clogs within the OIL GLANDS. No numbing or corneal shields, takes only 2 minutes to perform. THREE WEEKS apart.",
+"TIXL":"TIXEL: HEAT to create channels to the DERMIS layer. We will tighten your lower lid and reduce the excess skin/hooding above your upper lid. THIS WILL PREPARE YOU FOR BETTER BLINK FUNCTION, however it still takes PRACTICE! Arrive 30 minutes early for NUMBING CREAM. DISCONTINUE Retinols ~5 days beforehand. EXPECT SWELLING FOR 24-72 HOURS AND a faint GRID appearance in areas.",
+"TIXF":"TIXEL: serums specific to the issue (redness, scar smoothing, hooding, under eye bags, lower lid tightening, volumizing, etc). Arrive 30 minutes early for NUMBING CREAM. DISCONTINUE Retinols beforehand. EXPECT SWELLING FOR 24-72 HOURS AND a faint GRID appearance in areas.",
+"PLUOP":"> CONISDER PUNCTAL PLUGS: Plugging the drainage canal. These buried plugs are made of collagen and will dissolve within 6 months.",
+"PLU":"KSICCA: plugs",
+"SBH":"SBH Hydroeyes 4x /day",
+"INCPRN":"INCREASE PRN DE3 TO 4/DAY",
+"EXPOS":"EXPOSURE DURING NIGHT CAUSING DRYNESS AT WAKE UP\n> Add Eyeseals Sleep Mask (and Hylo PM ointment if still waking up dry)",
+"LAG":"EYE SEAL MASK a/o use press and seal over eyes at night. (add HYLO PM ointment if still waking up dry)",
+"EAT":"Eat more GOOD FATS: WILD CAUGHT OILY FISH 2/WEEK, NUTS, SEEDS: HEMP SEED, chia seed, flax seed, olive oil, walnut, avocado. <SEE LIST IN THE BOOK>",
+"DED":"DRY EYE DRINK HELPS YOU ABSORB NUTRIENTS FROM WATER. It makes 1 water absorb as if it were 3 bottles of water. Dry Eye Drink has ELECTROLYTES, ANTIINFLAMMATORIES, and SUPPLEMENTS that help dry eye, BUT NO SUGAR.\nPM VERSION: with melatonin, valerian root, chamomile to help you relax and sleep.",
+"LLTT":"LOW LEVEL LIGHT THERAPY (BIOPHOTOMODULATION): RED and INFRARED help reduce inflammation BLUE helps with rosacea. YELLOW helps with lymphatic drainage and allergies. ALL FOUR COLORS are used at once for 15 minutes, twice per week for 3 weeks. ONE session is needed as a BOOSTER EVERY ~3 MONTHS to maintain results.",
+"OILNERVES":"DO NOTHING for the nerves, but EVACUATE GLANDS to get more oil on the surface to protect the surface from damage."
 };
 
   window.__deisSrc = SRC;
@@ -2484,6 +2653,6 @@
   try { document.addEventListener('DOMContentLoaded', seed); } catch(e){}
 
   window.__deisBoot = function(){ return eval(SRC.DEISBOOT); };
-  window.__deisVersion = 'DEIS complete 3.9 (self-updating from GitHub) - popup fix ON, patientName+clearSafe+plan-visibility+preSave+gapFix+infoAdd+revertCount+liveChecked+dateGuard+gapSepFix+setOneGuard+infoAppendFix+hScrollFix folded in, ' + Object.keys(SRC).length +
+  window.__deisVersion = 'DEIS complete 3.10 (self-updating from GitHub) - popup fix ON, patientName+clearSafe+plan-visibility+preSave+gapFix+infoAdd+revertCount+liveChecked+dateGuard+gapSepFix+setOneGuard+infoAppendFix+hScrollFix+symWordBoundaryFix folded in, ' + Object.keys(SRC).length +
     ' modules + ' + Object.keys(ACRO).length + ' acronyms, seeded ' + new Date().toLocaleTimeString();
 })();
